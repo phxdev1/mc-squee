@@ -1,0 +1,557 @@
+name: Zero-Infrastructure MCP Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      protocol_repo:
+        description: 'GitHub repository URL of the MCP protocol to host'
+        required: true
+      protocol_branch:
+        description: 'Branch of the MCP protocol to use'
+        required: true
+        default: 'main'
+      tenant_name:
+        description: 'Name for this protocol tenant'
+        required: true
+  repository_dispatch:
+    types: [mcp_message]
+  schedule:
+    - cron: '*/10 * * * *'  # Run every 10 minutes to check message queues
+
+jobs:
+  # Initial protocol deployment and registration
+  register_protocol:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      protocol_id: ${{ steps.generate_id.outputs.protocol_id }}
+      tenant_name: ${{ steps.sanitize.outputs.tenant_name }}
+    
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v3
+      
+      - name: Sanitize tenant name
+        id: sanitize
+        run: |
+          TENANT_NAME=$(echo "${{ github.event.inputs.tenant_name }}" | tr -dc '[:alnum:]\-_' | tr '[:upper:]' '[:lower:]')
+          echo "tenant_name=$TENANT_NAME" >> $GITHUB_OUTPUT
+      
+      - name: Generate unique protocol ID
+        id: generate_id
+        run: |
+          TIMESTAMP=$(date +%s)
+          RANDOM_SUFFIX=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)
+          PROTOCOL_ID="${{ steps.sanitize.outputs.tenant_name }}-$TIMESTAMP-$RANDOM_SUFFIX"
+          echo "protocol_id=$PROTOCOL_ID" >> $GITHUB_OUTPUT
+      
+      - name: Clone protocol repository
+        run: |
+          # Extract owner and repo from URL
+          REPO_URL="${{ github.event.inputs.protocol_repo }}"
+          if [[ $REPO_URL =~ github.com/([^/]+)/([^/]+) ]]; then
+            OWNER=${BASH_REMATCH[1]}
+            REPO=${BASH_REMATCH[2]%.git}
+            
+            # Clone the repo into a subdirectory
+            git clone -b ${{ github.event.inputs.protocol_branch }} --depth 1 https://github.com/$OWNER/$REPO.git protocol-source
+          else
+            echo "Invalid GitHub repository URL"
+            exit 1
+          fi
+      
+      - name: Verify protocol structure
+        run: |
+          cd protocol-source
+          
+          # Check for protocol configuration
+          if [ ! -f "protocol.json" ] && [ ! -f "protocol.yaml" ] && [ ! -f "protocol.yml" ]; then
+            echo "Error: Missing protocol configuration file"
+            exit 1
+          fi
+          
+          # Check for schema directory
+          if [ ! -d "schemas" ]; then
+            echo "Error: Missing schemas directory"
+            exit 1
+          fi
+          
+          # Check for message handlers
+          if [ ! -d "handlers" ]; then
+            mkdir -p handlers
+            echo "Created handlers directory"
+          fi
+          
+          echo "Protocol structure verification complete"
+      
+      - name: Setup protocol registry
+        run: |
+          # Create protocols directory if it doesn't exist
+          mkdir -p .mcp/protocols
+          
+          # Create tenant directory
+          mkdir -p .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}
+          
+          # Copy protocol files
+          cp -r protocol-source/* .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}/
+          
+          # Create protocol registration metadata
+          cat > .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}/metadata.json << EOF
+          {
+            "protocol_id": "${{ steps.generate_id.outputs.protocol_id }}",
+            "tenant_name": "${{ steps.sanitize.outputs.tenant_name }}",
+            "source_repo": "${{ github.event.inputs.protocol_repo }}",
+            "source_branch": "${{ github.event.inputs.protocol_branch }}",
+            "deployed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "deployed_by": "${{ github.actor }}"
+          }
+          EOF
+          
+          # Create message queue directory
+          mkdir -p .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}/messages
+          
+          # Create agents directory
+          mkdir -p .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}/agents
+      
+      - name: Create registry index
+        run: |
+          # Create or update protocol registry index
+          if [ ! -f ".mcp/registry.json" ]; then
+            echo '{"protocols":[]}' > .mcp/registry.json
+          fi
+          
+          # Add new protocol to registry
+          jq --arg id "${{ steps.generate_id.outputs.protocol_id }}" \
+             --arg name "${{ steps.sanitize.outputs.tenant_name }}" \
+             --arg repo "${{ github.event.inputs.protocol_repo }}" \
+             --arg branch "${{ github.event.inputs.protocol_branch }}" \
+             --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+             '.protocols += [{
+                "id": $id,
+                "name": $name,
+                "source_repo": $repo,
+                "source_branch": $branch,
+                "registered_at": $time,
+                "status": "active"
+              }]' \
+             .mcp/registry.json > .mcp/registry.json.new && mv .mcp/registry.json.new .mcp/registry.json
+      
+      - name: Generate API keys and secret tokens
+        run: |
+          # Generate a secure API key
+          API_KEY=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
+          
+          # Generate webhook secret
+          WEBHOOK_SECRET=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
+          
+          # Store secrets
+          mkdir -p .mcp/secrets
+          echo "$API_KEY" > .mcp/secrets/${{ steps.generate_id.outputs.protocol_id }}_api_key
+          echo "$WEBHOOK_SECRET" > .mcp/secrets/${{ steps.generate_id.outputs.protocol_id }}_webhook_secret
+          
+          # Create documentation file with API key (would be sent via email in real system)
+          mkdir -p .mcp/docs
+          cat > .mcp/docs/${{ steps.generate_id.outputs.protocol_id }}_access.md << EOF
+          # MCP Protocol Access Information
+          
+          Your MCP protocol has been successfully deployed!
+          
+          ## Protocol Details
+          
+          - **Protocol ID:** ${{ steps.generate_id.outputs.protocol_id }}
+          - **Tenant Name:** ${{ steps.sanitize.outputs.tenant_name }}
+          - **Source Repository:** ${{ github.event.inputs.protocol_repo }}
+          - **Branch:** ${{ github.event.inputs.protocol_branch }}
+          
+          ## API Access
+          
+          To send messages to this MCP, use the following:
+          
+          - **API Endpoint:** https://github.com/${{ github.repository }}/actions/workflows/mcp-server.yml
+          - **API Key:** $API_KEY
+          
+          Include this API key in the Authorization header:
+          \`\`\`
+          Authorization: Bearer $API_KEY
+          \`\`\`
+          
+          ## Webhook Configuration
+          
+          If you want to receive messages from the MCP, configure a webhook endpoint in your agent with:
+          
+          - **Webhook Secret:** $WEBHOOK_SECRET
+          
+          Use this secret to verify incoming webhook requests from the MCP.
+          
+          ## Registration Example
+          
+          To register an agent with this MCP:
+          
+          \`\`\`bash
+          curl -X POST \\
+            -H "Authorization: Bearer $API_KEY" \\
+            -H "Content-Type: application/json" \\
+            -d '{
+              "event_type": "mcp_message",
+              "client_payload": {
+                "action": "register_agent",
+                "protocol_id": "${{ steps.generate_id.outputs.protocol_id }}",
+                "agent_id": "your-agent-id",
+                "agent_name": "Your Agent Name",
+                "capabilities": ["capability1", "capability2"],
+                "webhook_url": "https://your-agent-service.com/webhook"
+              }
+            }' \\
+            https://api.github.com/repos/${{ github.repository }}/dispatches
+          \`\`\`
+          
+          ## Sending a Message Example
+          
+          \`\`\`bash
+          curl -X POST \\
+            -H "Authorization: Bearer $API_KEY" \\
+            -H "Content-Type: application/json" \\
+            -d '{
+              "event_type": "mcp_message",
+              "client_payload": {
+                "action": "send_message",
+                "protocol_id": "${{ steps.generate_id.outputs.protocol_id }}",
+                "message": {
+                  "from_agent": "agent-a",
+                  "to_agent": "agent-b",
+                  "type": "request",
+                  "content": {
+                    "your_message": "data_here"
+                  }
+                }
+              }
+            }' \\
+            https://api.github.com/repos/${{ github.repository }}/dispatches
+          \`\`\`
+          EOF
+      
+      - name: Commit changes
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          git add .mcp/
+          git commit -m "Register MCP protocol: ${{ steps.sanitize.outputs.tenant_name }}"
+          git push
+      
+      - name: Upload documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: mcp-access-docs-${{ steps.generate_id.outputs.protocol_id }}
+          path: .mcp/docs/${{ steps.generate_id.outputs.protocol_id }}_access.md
+
+  # Handle incoming messages for the MCP
+  process_message:
+    if: github.event_name == 'repository_dispatch' && github.event.action == 'mcp_message'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml jsonschema requests
+      
+      - name: Process incoming message
+        run: |
+          PROTOCOL_ID="${{ github.event.client_payload.protocol_id }}"
+          ACTION="${{ github.event.client_payload.action }}"
+          
+          # Validate protocol exists
+          if [ ! -d ".mcp/protocols/$PROTOCOL_ID" ]; then
+            echo "Error: Protocol not found"
+            exit 1
+          fi
+          
+          # Verify API key (simulated here - would validate against stored key)
+          echo "API key validation would happen here"
+          
+          # Process based on action type
+          case "$ACTION" in
+            "register_agent")
+              # Extract agent information
+              AGENT_ID="${{ github.event.client_payload.agent_id }}"
+              AGENT_NAME="${{ github.event.client_payload.agent_name }}"
+              WEBHOOK_URL="${{ github.event.client_payload.webhook_url }}"
+              
+              # Create agent registration file
+              cat > .mcp/protocols/$PROTOCOL_ID/agents/$AGENT_ID.json << EOF
+              {
+                "agent_id": "$AGENT_ID",
+                "agent_name": "$AGENT_NAME",
+                "capabilities": ${{ toJSON(github.event.client_payload.capabilities) }},
+                "webhook_url": "$WEBHOOK_URL",
+                "registered_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+                "status": "active"
+              }
+              EOF
+              
+              echo "Agent $AGENT_ID registered with protocol $PROTOCOL_ID"
+              ;;
+              
+            "send_message")
+              # Extract message data
+              FROM_AGENT="${{ github.event.client_payload.message.from_agent }}"
+              TO_AGENT="${{ github.event.client_payload.message.to_agent }}"
+              MESSAGE_TYPE="${{ github.event.client_payload.message.type }}"
+              
+              # Validate sending agent exists
+              if [ ! -f ".mcp/protocols/$PROTOCOL_ID/agents/$FROM_AGENT.json" ]; then
+                echo "Error: Sending agent not registered"
+                exit 1
+              fi
+              
+              # Validate receiving agent exists
+              if [ ! -f ".mcp/protocols/$PROTOCOL_ID/agents/$TO_AGENT.json" ]; then
+                echo "Error: Receiving agent not registered"
+                exit 1
+              fi
+              
+              # Create unique message ID
+              MESSAGE_ID="msg-$(date +%s)-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)"
+              
+              # Save message to queue
+              cat > .mcp/protocols/$PROTOCOL_ID/messages/$MESSAGE_ID.json << EOF
+              {
+                "message_id": "$MESSAGE_ID",
+                "from_agent": "$FROM_AGENT",
+                "to_agent": "$TO_AGENT",
+                "type": "$MESSAGE_TYPE",
+                "content": ${{ toJSON(github.event.client_payload.message.content) }},
+                "status": "pending",
+                "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+              }
+              EOF
+              
+              echo "Message $MESSAGE_ID queued for delivery"
+              ;;
+              
+            *)
+              echo "Error: Unknown action type"
+              exit 1
+              ;;
+          esac
+      
+      - name: Commit message updates
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          git add .mcp/
+          git commit -m "Process MCP message: ${{ github.event.client_payload.action }}"
+          git push
+
+  # Process message queue and deliver messages
+  deliver_messages:
+    if: github.event_name == 'schedule' || (github.event_name == 'repository_dispatch' && github.event.client_payload.action == 'send_message')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+      
+      - name: Process message queue
+        run: |
+          # Find all protocols
+          for PROTOCOL_DIR in .mcp/protocols/*; do
+            if [ -d "$PROTOCOL_DIR" ]; then
+              PROTOCOL_ID=$(basename "$PROTOCOL_DIR")
+              echo "Processing messages for protocol: $PROTOCOL_ID"
+              
+              # Find pending messages
+              for MESSAGE_FILE in $PROTOCOL_DIR/messages/*.json; do
+                if [ -f "$MESSAGE_FILE" ]; then
+                  # Check if message is pending
+                  MESSAGE_STATUS=$(jq -r '.status' "$MESSAGE_FILE")
+                  
+                  if [ "$MESSAGE_STATUS" == "pending" ]; then
+                    MESSAGE_ID=$(jq -r '.message_id' "$MESSAGE_FILE")
+                    TO_AGENT=$(jq -r '.to_agent' "$MESSAGE_FILE")
+                    
+                    echo "Delivering message $MESSAGE_ID to agent $TO_AGENT"
+                    
+                    # Get agent webhook URL
+                    if [ -f "$PROTOCOL_DIR/agents/$TO_AGENT.json" ]; then
+                      WEBHOOK_URL=$(jq -r '.webhook_url' "$PROTOCOL_DIR/agents/$TO_AGENT.json")
+                      
+                      # Deliver message (simulated - would actually call the webhook)
+                      echo "Would deliver to webhook: $WEBHOOK_URL"
+                      
+                      # Update message status to delivered
+                      jq '.status = "delivered" | .delivered_at = "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"' "$MESSAGE_FILE" > "$MESSAGE_FILE.tmp"
+                      mv "$MESSAGE_FILE.tmp" "$MESSAGE_FILE"
+                      
+                      echo "Message $MESSAGE_ID marked as delivered"
+                    else
+                      echo "Error: Agent $TO_AGENT not found"
+                      
+                      # Mark message as failed
+                      jq '.status = "failed" | .error = "Recipient agent not found"' "$MESSAGE_FILE" > "$MESSAGE_FILE.tmp"
+                      mv "$MESSAGE_FILE.tmp" "$MESSAGE_FILE"
+                    fi
+                  fi
+                fi
+              done
+            fi
+          done
+      
+      - name: Commit message delivery updates
+        run: |
+          # Check if there are changes to commit
+          if git diff --quiet .mcp/; then
+            echo "No message deliveries to commit"
+            exit 0
+          fi
+          
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          git add .mcp/
+          git commit -m "Process MCP message deliveries"
+          git push
+
+  # Expose API endpoints through GitHub Pages (static documentation)
+  update_api_docs:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: register_protocol
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml jinja2 markdown
+      
+      - name: Generate API documentation
+        run: |
+          mkdir -p docs
+          
+          # Create main index page
+          cat > docs/index.md << EOF
+          # MCP Protocol Server
+          
+          This repository hosts a zero-infrastructure Multi-Agent Communication Protocol (MCP) server.
+          
+          ## Available Protocols
+          
+          | Protocol ID | Name | Registered At | Status |
+          |------------|------|--------------|--------|
+          EOF
+          
+          # Add protocol entries
+          jq -r '.protocols[] | "| \(.id) | \(.name) | \(.registered_at) | \(.status) |"' .mcp/registry.json >> docs/index.md
+          
+          # Create protocol-specific page
+          mkdir -p docs/protocols
+          cat > docs/protocols/${{ needs.register_protocol.outputs.protocol_id }}.md << EOF
+          # Protocol: ${{ needs.register_protocol.outputs.tenant_name }}
+          
+          Protocol ID: \`${{ needs.register_protocol.outputs.protocol_id }}\`
+          
+          ## Overview
+          
+          This protocol was registered from [${{ github.event.inputs.protocol_repo }}](${{ github.event.inputs.protocol_repo }}) using the \`${{ github.event.inputs.protocol_branch }}\` branch.
+          
+          ## API Usage
+          
+          To interact with this protocol, you need to authenticate with your API key and send requests to the GitHub repository dispatch endpoint.
+          
+          ### Registering an Agent
+          
+          \`\`\`bash
+          # Example cURL request to register an agent
+          curl -X POST \\
+            -H "Authorization: Bearer YOUR_API_KEY" \\
+            -H "Content-Type: application/json" \\
+            -d '{
+              "event_type": "mcp_message",
+              "client_payload": {
+                "action": "register_agent",
+                "protocol_id": "${{ needs.register_protocol.outputs.protocol_id }}",
+                "agent_id": "your-agent-id",
+                "agent_name": "Your Agent Name",
+                "capabilities": ["capability1", "capability2"],
+                "webhook_url": "https://your-agent-service.com/webhook"
+              }
+            }' \\
+            https://api.github.com/repos/${{ github.repository }}/dispatches
+          \`\`\`
+          
+          ### Sending a Message
+          
+          \`\`\`bash
+          # Example cURL request to send a message
+          curl -X POST \\
+            -H "Authorization: Bearer YOUR_API_KEY" \\
+            -H "Content-Type: application/json" \\
+            -d '{
+              "event_type": "mcp_message",
+              "client_payload": {
+                "action": "send_message",
+                "protocol_id": "${{ needs.register_protocol.outputs.protocol_id }}",
+                "message": {
+                  "from_agent": "agent-a",
+                  "to_agent": "agent-b",
+                  "type": "request",
+                  "content": {
+                    "your_message": "data_here"
+                  }
+                }
+              }
+            }' \\
+            https://api.github.com/repos/${{ github.repository }}/dispatches
+          \`\`\`
+          
+          ## Registered Agents
+          
+          Agents registered with this protocol will appear here.
+          
+          EOF
+      
+      - name: Configure GitHub Pages
+        run: |
+          # Create _config.yml for GitHub Pages
+          cat > docs/_config.yml << EOF
+          theme: jekyll-theme-minimal
+          title: MCP Protocol Server
+          description: Zero-infrastructure Multi-Agent Communication Protocol (MCP) server using GitHub Actions
+          EOF
+      
+      - name: Commit API documentation
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          git add docs/
+          git commit -m "Update API documentation"
+          git push
