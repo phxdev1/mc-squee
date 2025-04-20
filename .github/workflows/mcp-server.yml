@@ -1,5 +1,14 @@
 name: Zero-Infrastructure MCP Server
 
+# Add permissions to allow the workflow to push to the repository
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  packages: read
+  id-token: write
+  actions: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -26,10 +35,16 @@ jobs:
     outputs:
       protocol_id: ${{ steps.generate_id.outputs.protocol_id }}
       tenant_name: ${{ steps.sanitize.outputs.tenant_name }}
+      protocol_type: ${{ steps.detect-protocol-type.outputs.protocol_type }}
     
     steps:
       - name: Checkout current repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          # Ensure we pull the full history for accurate commits
+          fetch-depth: 0
+          # Use token to enable pushing back to the repository
+          token: ${{ github.token }}
       
       - name: Sanitize tenant name
         id: sanitize
@@ -41,8 +56,14 @@ jobs:
         id: generate_id
         run: |
           TIMESTAMP=$(date +%s)
-          RANDOM_SUFFIX=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)
-          PROTOCOL_ID="${{ steps.sanitize.outputs.tenant_name }}-$TIMESTAMP-$RANDOM_SUFFIX"
+          # Use $RANDOM bash variable instead of /dev/urandom
+          RANDOM_STRING=""
+          for i in {1..8}; do
+            CHARS="abcdefghijklmnopqrstuvwxyz0123456789"
+            RANDOM_CHAR=${CHARS:$((RANDOM % ${#CHARS})):1}
+            RANDOM_STRING="$RANDOM_STRING$RANDOM_CHAR"
+          done
+          PROTOCOL_ID="${{ steps.sanitize.outputs.tenant_name }}-$TIMESTAMP-$RANDOM_STRING"
           echo "protocol_id=$PROTOCOL_ID" >> $GITHUB_OUTPUT
       
       - name: Clone protocol repository
@@ -60,23 +81,53 @@ jobs:
             exit 1
           fi
       
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          
       - name: Verify protocol structure
+        id: detect-protocol-type
         run: |
           cd protocol-source
           
-          # Check for protocol configuration
-          if [ ! -f "protocol.json" ] && [ ! -f "protocol.yaml" ] && [ ! -f "protocol.yml" ]; then
-            echo "Error: Missing protocol configuration file"
-            exit 1
+          # Initialize protocol type as unknown
+          PROTOCOL_TYPE="unknown"
+          
+          # Check for Python MCP structure (like Neo4j MCP)
+          if [ -d "servers" ] && ([ -f "setup.py" ] || [ -d "servers/mcp-neo4j-cypher" ] || [ -d "servers/mcp-neo4j-memory" ]); then
+            echo "Detected Python-based MCP structure (Neo4j style)"
+            PROTOCOL_TYPE="python"
+          # Check for TypeScript/JavaScript MCP structure (like Perplexity)
+          elif ([ -f "index.ts" ] || [ -f "index.js" ]) && [ -f "package.json" ]; then
+            echo "Detected TypeScript/JavaScript MCP structure (Perplexity style)"
+            PROTOCOL_TYPE="typescript"
+          # Check for protocol configuration file
+          elif [ -f "protocol.json" ] || [ -f "protocol.yaml" ] || [ -f "protocol.yml" ]; then
+            echo "Found protocol configuration file"
+            if [ -d "schemas" ]; then
+              echo "Found schemas directory"
+              PROTOCOL_TYPE="generic"
+            fi
+          else
+            echo "Unknown protocol structure, will use generic handlers"
+            PROTOCOL_TYPE="generic"
           fi
           
-          # Check for schema directory
+          # Output the protocol type for later steps
+          echo "protocol_type=$PROTOCOL_TYPE" >> $GITHUB_OUTPUT
+          
+          # Create necessary directories if they don't exist
           if [ ! -d "schemas" ]; then
-            echo "Error: Missing schemas directory"
-            exit 1
+            mkdir -p schemas
+            echo "Created schemas directory"
           fi
           
-          # Check for message handlers
           if [ ! -d "handlers" ]; then
             mkdir -p handlers
             echo "Created handlers directory"
@@ -94,6 +145,7 @@ jobs:
           
           # Copy protocol files
           cp -r protocol-source/* .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}/
+          cp -r protocol-source/.* .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}/ 2>/dev/null || true
           
           # Create protocol registration metadata
           cat > .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}/metadata.json << EOF
@@ -102,6 +154,7 @@ jobs:
             "tenant_name": "${{ steps.sanitize.outputs.tenant_name }}",
             "source_repo": "${{ github.event.inputs.protocol_repo }}",
             "source_branch": "${{ github.event.inputs.protocol_branch }}",
+            "protocol_type": "${{ steps.detect-protocol-type.outputs.protocol_type }}",
             "deployed_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
             "deployed_by": "${{ github.actor }}"
           }
@@ -113,6 +166,65 @@ jobs:
           # Create agents directory
           mkdir -p .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}/agents
       
+      - name: Install Python dependencies
+        if: steps.detect-protocol-type.outputs.protocol_type == 'python'
+        run: |
+          # Install pip dependencies if setup.py exists
+          cd .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}
+          
+          if [ -f "setup.py" ]; then
+            pip install -e .
+            echo "Installed Python package in development mode"
+          fi
+          
+          # Check for requirements.txt
+          if [ -f "requirements.txt" ]; then
+            pip install -r requirements.txt
+            echo "Installed dependencies from requirements.txt"
+          fi
+          
+          # Check for specific Neo4j MCP servers
+          if [ -d "servers/mcp-neo4j-cypher" ]; then
+            cd servers/mcp-neo4j-cypher
+            if [ -f "requirements.txt" ]; then
+              pip install -r requirements.txt
+            fi
+            if [ -f "setup.py" ]; then
+              pip install -e .
+            fi
+            cd ../..
+            echo "Installed Neo4j Cypher MCP server"
+          fi
+          
+          if [ -d "servers/mcp-neo4j-memory" ]; then
+            cd servers/mcp-neo4j-memory
+            if [ -f "requirements.txt" ]; then
+              pip install -r requirements.txt
+            fi
+            if [ -f "setup.py" ]; then
+              pip install -e .
+            fi
+            cd ../..
+            echo "Installed Neo4j Memory MCP server"
+          fi
+      
+      - name: Install Node.js dependencies
+        if: steps.detect-protocol-type.outputs.protocol_type == 'typescript'
+        run: |
+          # Check if package.json exists
+          if [ -f ".mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}/package.json" ]; then
+            cd .mcp/protocols/${{ steps.generate_id.outputs.protocol_id }}
+            npm install
+            
+            # If TypeScript is found, compile it
+            if [ -f "tsconfig.json" ] && [ -f "index.ts" ]; then
+              echo "TypeScript project detected, compiling..."
+              npx tsc
+            fi
+          else
+            echo "No package.json found, skipping dependency installation"
+          fi
+      
       - name: Create registry index
         run: |
           # Create or update protocol registry index
@@ -120,36 +232,53 @@ jobs:
             echo '{"protocols":[]}' > .mcp/registry.json
           fi
           
-          # Add new protocol to registry
-          jq --arg id "${{ steps.generate_id.outputs.protocol_id }}" \
-             --arg name "${{ steps.sanitize.outputs.tenant_name }}" \
-             --arg repo "${{ github.event.inputs.protocol_repo }}" \
-             --arg branch "${{ github.event.inputs.protocol_branch }}" \
-             --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-             '.protocols += [{
-                "id": $id,
-                "name": $name,
-                "source_repo": $repo,
-                "source_branch": $branch,
-                "registered_at": $time,
-                "status": "active"
-              }]' \
-             .mcp/registry.json > .mcp/registry.json.new && mv .mcp/registry.json.new .mcp/registry.json
+          # Add new protocol to registry using jq if available
+          if command -v jq &> /dev/null; then
+            jq --arg id "${{ steps.generate_id.outputs.protocol_id }}" \
+              --arg name "${{ steps.sanitize.outputs.tenant_name }}" \
+              --arg repo "${{ github.event.inputs.protocol_repo }}" \
+              --arg branch "${{ github.event.inputs.protocol_branch }}" \
+              --arg type "${{ steps.detect-protocol-type.outputs.protocol_type }}" \
+              --arg time "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+              '.protocols += [{
+                  "id": $id,
+                  "name": $name,
+                  "source_repo": $repo,
+                  "source_branch": $branch,
+                  "protocol_type": $type,
+                  "registered_at": $time,
+                  "status": "active"
+                }]' \
+              .mcp/registry.json > .mcp/registry.json.new && mv .mcp/registry.json.new .mcp/registry.json
+          else
+            # Fallback if jq is not available
+            PROTOCOL_ENTRY="{\"id\":\"${{ steps.generate_id.outputs.protocol_id }}\",\"name\":\"${{ steps.sanitize.outputs.tenant_name }}\",\"source_repo\":\"${{ github.event.inputs.protocol_repo }}\",\"source_branch\":\"${{ github.event.inputs.protocol_branch }}\",\"protocol_type\":\"${{ steps.detect-protocol-type.outputs.protocol_type }}\",\"registered_at\":\"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",\"status\":\"active\"}"
+            
+            # Use basic sed to add the entry to the registry
+            sed -i 's/"protocols":\[/"protocols":['"$PROTOCOL_ENTRY"',/g' .mcp/registry.json
+          fi
       
       - name: Generate API keys and secret tokens
         run: |
-          # Generate a secure API key
-          API_KEY=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
+          # Generate a secure API key using bash
+          API_KEY=""
+          CHARS="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+          for i in {1..32}; do
+            API_KEY="$API_KEY${CHARS:$((RANDOM % ${#CHARS})):1}"
+          done
           
-          # Generate webhook secret
-          WEBHOOK_SECRET=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
+          # Generate webhook secret using bash
+          WEBHOOK_SECRET=""
+          for i in {1..32}; do
+            WEBHOOK_SECRET="$WEBHOOK_SECRET${CHARS:$((RANDOM % ${#CHARS})):1}"
+          done
           
           # Store secrets
           mkdir -p .mcp/secrets
           echo "$API_KEY" > .mcp/secrets/${{ steps.generate_id.outputs.protocol_id }}_api_key
           echo "$WEBHOOK_SECRET" > .mcp/secrets/${{ steps.generate_id.outputs.protocol_id }}_webhook_secret
           
-          # Create documentation file with API key (would be sent via email in real system)
+          # Create documentation file with API key 
           mkdir -p .mcp/docs
           cat > .mcp/docs/${{ steps.generate_id.outputs.protocol_id }}_access.md << EOF
           # MCP Protocol Access Information
@@ -162,6 +291,7 @@ jobs:
           - **Tenant Name:** ${{ steps.sanitize.outputs.tenant_name }}
           - **Source Repository:** ${{ github.event.inputs.protocol_repo }}
           - **Branch:** ${{ github.event.inputs.protocol_branch }}
+          - **Protocol Type:** ${{ steps.detect-protocol-type.outputs.protocol_type }}
           
           ## API Access
           
@@ -182,6 +312,27 @@ jobs:
           - **Webhook Secret:** $WEBHOOK_SECRET
           
           Use this secret to verify incoming webhook requests from the MCP.
+          
+          ## Configuration for Claude Desktop
+          
+          To use this protocol with Claude Desktop, add the following to your claude_desktop_config.json:
+          
+          \`\`\`json
+          {
+            "mcpServers": {
+              "${{ steps.sanitize.outputs.tenant_name }}": {
+                "command": "npx",
+                "args": [
+                  "mcp-runner",
+                  "${{ steps.generate_id.outputs.protocol_id }}"
+                ],
+                "env": {
+                  "MCP_API_KEY": "$API_KEY"
+                }
+              }
+            }
+          }
+          \`\`\`
           
           ## Registration Example
           
@@ -230,17 +381,194 @@ jobs:
           \`\`\`
           EOF
       
+      - name: Create MCP Runner Script
+        run: |
+          # Create a script to run the MCP protocol
+          mkdir -p .mcp/bin
+          cat > .mcp/bin/mcp-runner.js << EOF
+          #!/usr/bin/env node
+          
+          const fs = require('fs');
+          const path = require('path');
+          const { spawn } = require('child_process');
+          
+          // Get protocol ID from args
+          const protocolId = process.argv[2];
+          
+          if (!protocolId) {
+            console.error('Error: Protocol ID is required');
+            process.exit(1);
+          }
+          
+          // Protocol directory
+          const protocolDir = path.join(__dirname, '../protocols', protocolId);
+          
+          if (!fs.existsSync(protocolDir)) {
+            console.error(\`Error: Protocol directory not found: \${protocolDir}\`);
+            process.exit(1);
+          }
+          
+          // Read protocol metadata to determine type
+          const metadataPath = path.join(protocolDir, 'metadata.json');
+          let protocolType = 'generic';
+          
+          if (fs.existsSync(metadataPath)) {
+            try {
+              const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+              protocolType = metadata.protocol_type || 'generic';
+            } catch (err) {
+              console.error(\`Error reading metadata: \${err.message}\`);
+            }
+          }
+          
+          // Determine how to run the protocol based on its type
+          let command;
+          let args;
+          let options = {
+            cwd: protocolDir,
+            stdio: 'inherit',
+            env: { ...process.env }
+          };
+          
+          switch (protocolType) {
+            case 'python':
+              // Check for Neo4j MCP servers
+              if (fs.existsSync(path.join(protocolDir, 'servers', 'mcp-neo4j-cypher'))) {
+                command = 'python';
+                args = ['-m', 'mcp_neo4j_cypher.app'];
+                options.cwd = path.join(protocolDir, 'servers', 'mcp-neo4j-cypher');
+              } else if (fs.existsSync(path.join(protocolDir, 'servers', 'mcp-neo4j-memory'))) {
+                command = 'python';
+                args = ['-m', 'mcp_neo4j_memory.app'];
+                options.cwd = path.join(protocolDir, 'servers', 'mcp-neo4j-memory');
+              } else {
+                // Default Python server
+                const mainPyFile = fs.existsSync(path.join(protocolDir, 'app.py')) 
+                  ? 'app.py' 
+                  : fs.existsSync(path.join(protocolDir, 'main.py'))
+                    ? 'main.py'
+                    : 'server.py';
+                
+                command = 'python';
+                args = [mainPyFile];
+              }
+              break;
+            
+            case 'typescript':
+              // Check if compiled JavaScript exists
+              if (fs.existsSync(path.join(protocolDir, 'dist/index.js'))) {
+                command = 'node';
+                args = ['dist/index.js'];
+              } else if (fs.existsSync(path.join(protocolDir, 'index.js'))) {
+                command = 'node';
+                args = ['index.js'];
+              } else if (fs.existsSync(path.join(protocolDir, 'index.ts'))) {
+                command = 'npx';
+                args = ['ts-node', 'index.ts'];
+              } else {
+                console.error('No entry point found for TypeScript server');
+                process.exit(1);
+              }
+              break;
+            
+            default:
+              // Try to detect the best way to run it
+              if (fs.existsSync(path.join(protocolDir, 'index.js'))) {
+                command = 'node';
+                args = ['index.js'];
+              } else if (fs.existsSync(path.join(protocolDir, 'index.ts'))) {
+                command = 'npx';
+                args = ['ts-node', 'index.ts'];
+              } else if (fs.existsSync(path.join(protocolDir, 'app.py')) || fs.existsSync(path.join(protocolDir, 'main.py'))) {
+                const mainPyFile = fs.existsSync(path.join(protocolDir, 'app.py')) ? 'app.py' : 'main.py';
+                command = 'python';
+                args = [mainPyFile];
+              } else {
+                console.error('Could not determine how to run the protocol');
+                process.exit(1);
+              }
+              break;
+          }
+          
+          console.log(\`Starting MCP protocol: \${protocolId} (type: \${protocolType})\`);
+          console.log(\`Command: \${command} \${args.join(' ')}\`);
+          
+          // Spawn process
+          const proc = spawn(command, args, options);
+          
+          // Handle process events
+          proc.on('close', (code) => {
+            console.log(\`Protocol process exited with code \${code}\`);
+            process.exit(code);
+          });
+          
+          proc.on('error', (err) => {
+            console.error(\`Failed to start protocol process: \${err}\`);
+            process.exit(1);
+          });
+          
+          // Handle signals
+          process.on('SIGINT', () => {
+            console.log('Received SIGINT, forwarding to protocol process');
+            proc.kill('SIGINT');
+          });
+          
+          process.on('SIGTERM', () => {
+            console.log('Received SIGTERM, forwarding to protocol process');
+            proc.kill('SIGTERM');
+          });
+          EOF
+          
+          # Make the script executable
+          chmod +x .mcp/bin/mcp-runner.js
+          
+          # Create package.json for runner
+          cd .mcp/bin
+          cat > package.json << EOF
+          {
+            "name": "mcp-runner",
+            "version": "1.0.0",
+            "description": "Runner for MCP protocols",
+            "main": "mcp-runner.js",
+            "bin": {
+              "mcp-runner": "mcp-runner.js"
+            },
+            "dependencies": {
+              "ts-node": "^10.9.1"
+            }
+          }
+          EOF
+          
+          # Install runner dependencies
+          npm install
+      
       - name: Commit changes
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           
+          # Stash any changes to create a clean working state
+          git stash -u || true
+          
+          # Pull latest changes
+          git pull --rebase origin ${{ github.ref_name }}
+          
+          # Reapply our changes
+          git stash pop || true
+          
+          # Stage changes
           git add .mcp/
-          git commit -m "Register MCP protocol: ${{ steps.sanitize.outputs.tenant_name }}"
-          git push
+          
+          # Only commit if there are changes to commit
+          if ! git diff --staged --quiet; then
+            git commit -m "Register MCP protocol: ${{ steps.sanitize.outputs.tenant_name }}"
+            git push
+          else
+            echo "No changes to commit"
+          fi
       
       - name: Upload documentation
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: mcp-access-docs-${{ steps.generate_id.outputs.protocol_id }}
           path: .mcp/docs/${{ steps.generate_id.outputs.protocol_id }}_access.md
@@ -250,12 +578,21 @@ jobs:
     if: github.event_name == 'repository_dispatch' && github.event.action == 'mcp_message'
     runs-on: ubuntu-latest
     
+    # Add permission for this job to write to the repository
+    permissions:
+      contents: write
+    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          # Ensure we pull the full history for accurate commits
+          fetch-depth: 0
+          # Use token to enable pushing back to the repository
+          token: ${{ github.token }}
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
       
@@ -319,8 +656,12 @@ jobs:
                 exit 1
               fi
               
-              # Create unique message ID
-              MESSAGE_ID="msg-$(date +%s)-$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 8 | head -n 1)"
+              # Create unique message ID using timestamp and bash $RANDOM
+              MESSAGE_ID="msg-$(date +%s)-"
+              for i in {1..8}; do
+                CHARS="abcdefghijklmnopqrstuvwxyz0123456789"
+                MESSAGE_ID="$MESSAGE_ID${CHARS:$((RANDOM % ${#CHARS})):1}"
+              done
               
               # Save message to queue
               cat > .mcp/protocols/$PROTOCOL_ID/messages/$MESSAGE_ID.json << EOF
@@ -349,21 +690,46 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           
+          # Stash any changes to create a clean working state
+          git stash -u || true
+          
+          # Pull latest changes
+          git pull --rebase origin ${{ github.ref_name }}
+          
+          # Reapply our changes
+          git stash pop || true
+          
+          # Stage changes
           git add .mcp/
-          git commit -m "Process MCP message: ${{ github.event.client_payload.action }}"
-          git push
+          
+          # Only commit if there are changes to commit
+          if ! git diff --staged --quiet; then
+            git commit -m "Process MCP message: ${{ github.event.client_payload.action }}"
+            git push
+          else
+            echo "No changes to commit"
+          fi
 
   # Process message queue and deliver messages
   deliver_messages:
     if: github.event_name == 'schedule' || (github.event_name == 'repository_dispatch' && github.event.client_payload.action == 'send_message')
     runs-on: ubuntu-latest
     
+    # Add permission for this job to write to the repository
+    permissions:
+      contents: write
+    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          # Ensure we pull the full history for accurate commits
+          fetch-depth: 0
+          # Use token to enable pushing back to the repository
+          token: ${{ github.token }}
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
       
@@ -374,42 +740,89 @@ jobs:
       
       - name: Process message queue
         run: |
+          # Check if .mcp directory exists
+          if [ ! -d ".mcp" ]; then
+            echo "No .mcp directory found, nothing to process"
+            exit 0
+          fi
+          
+          # Initialize jq if available
+          JQ_AVAILABLE=false
+          if command -v jq &> /dev/null; then
+            JQ_AVAILABLE=true
+          fi
+          
           # Find all protocols
           for PROTOCOL_DIR in .mcp/protocols/*; do
             if [ -d "$PROTOCOL_DIR" ]; then
               PROTOCOL_ID=$(basename "$PROTOCOL_DIR")
               echo "Processing messages for protocol: $PROTOCOL_ID"
               
+              # Check if messages directory exists and is not empty
+              if [ ! -d "$PROTOCOL_DIR/messages" ] || [ -z "$(ls -A $PROTOCOL_DIR/messages 2>/dev/null)" ]; then
+                echo "No messages to process for protocol: $PROTOCOL_ID"
+                continue
+              fi
+              
               # Find pending messages
               for MESSAGE_FILE in $PROTOCOL_DIR/messages/*.json; do
                 if [ -f "$MESSAGE_FILE" ]; then
-                  # Check if message is pending
-                  MESSAGE_STATUS=$(jq -r '.status' "$MESSAGE_FILE")
+                  # Parse message status
+                  MESSAGE_STATUS=""
+                  if [ "$JQ_AVAILABLE" = true ]; then
+                    MESSAGE_STATUS=$(jq -r '.status' "$MESSAGE_FILE")
+                  else
+                    # Simple grep fallback if jq is not available
+                    MESSAGE_STATUS=$(grep -o '"status":"[^"]*"' "$MESSAGE_FILE" | cut -d'"' -f4)
+                  fi
                   
-                  if [ "$MESSAGE_STATUS" == "pending" ]; then
-                    MESSAGE_ID=$(jq -r '.message_id' "$MESSAGE_FILE")
-                    TO_AGENT=$(jq -r '.to_agent' "$MESSAGE_FILE")
+                  if [ "$MESSAGE_STATUS" = "pending" ]; then
+                    # Parse message ID and recipient
+                    if [ "$JQ_AVAILABLE" = true ]; then
+                      MESSAGE_ID=$(jq -r '.message_id' "$MESSAGE_FILE")
+                      TO_AGENT=$(jq -r '.to_agent' "$MESSAGE_FILE")
+                    else
+                      MESSAGE_ID=$(grep -o '"message_id":"[^"]*"' "$MESSAGE_FILE" | cut -d'"' -f4)
+                      TO_AGENT=$(grep -o '"to_agent":"[^"]*"' "$MESSAGE_FILE" | cut -d'"' -f4)
+                    fi
                     
                     echo "Delivering message $MESSAGE_ID to agent $TO_AGENT"
                     
                     # Get agent webhook URL
                     if [ -f "$PROTOCOL_DIR/agents/$TO_AGENT.json" ]; then
-                      WEBHOOK_URL=$(jq -r '.webhook_url' "$PROTOCOL_DIR/agents/$TO_AGENT.json")
+                      WEBHOOK_URL=""
+                      if [ "$JQ_AVAILABLE" = true ]; then
+                        WEBHOOK_URL=$(jq -r '.webhook_url' "$PROTOCOL_DIR/agents/$TO_AGENT.json")
+                      else
+                        WEBHOOK_URL=$(grep -o '"webhook_url":"[^"]*"' "$PROTOCOL_DIR/agents/$TO_AGENT.json" | cut -d'"' -f4)
+                      fi
                       
                       # Deliver message (simulated - would actually call the webhook)
                       echo "Would deliver to webhook: $WEBHOOK_URL"
                       
                       # Update message status to delivered
-                      jq '.status = "delivered" | .delivered_at = "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"' "$MESSAGE_FILE" > "$MESSAGE_FILE.tmp"
-                      mv "$MESSAGE_FILE.tmp" "$MESSAGE_FILE"
+                      if [ "$JQ_AVAILABLE" = true ]; then
+                        jq '.status = "delivered" | .delivered_at = "'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"' "$MESSAGE_FILE" > "$MESSAGE_FILE.tmp"
+                        mv "$MESSAGE_FILE.tmp" "$MESSAGE_FILE"
+                      else
+                        # Simple sed fallback
+                        sed -i 's/"status":"pending"/"status":"delivered"/g' "$MESSAGE_FILE"
+                        sed -i 's/}/,"delivered_at":"'$(date -u +"%Y-%m-%dT%H:%M:%SZ")'"}/g' "$MESSAGE_FILE"
+                      fi
                       
                       echo "Message $MESSAGE_ID marked as delivered"
                     else
                       echo "Error: Agent $TO_AGENT not found"
                       
                       # Mark message as failed
-                      jq '.status = "failed" | .error = "Recipient agent not found"' "$MESSAGE_FILE" > "$MESSAGE_FILE.tmp"
-                      mv "$MESSAGE_FILE.tmp" "$MESSAGE_FILE"
+                      if [ "$JQ_AVAILABLE" = true ]; then
+                        jq '.status = "failed" | .error = "Recipient agent not found"' "$MESSAGE_FILE" > "$MESSAGE_FILE.tmp"
+                        mv "$MESSAGE_FILE.tmp" "$MESSAGE_FILE"
+                      else
+                        # Simple sed fallback
+                        sed -i 's/"status":"pending"/"status":"failed"/g' "$MESSAGE_FILE"
+                        sed -i 's/}/,"error":"Recipient agent not found"}/g' "$MESSAGE_FILE"
+                      fi
                     fi
                   fi
                 fi
@@ -428,9 +841,25 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           
+          # Stash any changes to create a clean working state
+          git stash -u || true
+          
+          # Pull latest changes
+          git pull --rebase origin ${{ github.ref_name }}
+          
+          # Reapply our changes
+          git stash pop || true
+          
+          # Stage changes
           git add .mcp/
-          git commit -m "Process MCP message deliveries"
-          git push
+          
+          # Only commit if there are changes to commit
+          if ! git diff --staged --quiet; then
+            git commit -m "Process MCP message deliveries"
+            git push
+          else
+            echo "No changes to commit"
+          fi
 
   # Expose API endpoints through GitHub Pages (static documentation)
   update_api_docs:
@@ -438,19 +867,28 @@ jobs:
     runs-on: ubuntu-latest
     needs: register_protocol
     
+    # Add permission for this job to write to the repository
+    permissions:
+      contents: write
+    
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+        with:
+          # Ensure we pull the full history for accurate commits
+          fetch-depth: 0
+          # Use token to enable pushing back to the repository
+          token: ${{ github.token }}
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
       
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyyaml jinja2 markdown
+          pip install markdown
       
       - name: Generate API documentation
         run: |
@@ -464,12 +902,17 @@ jobs:
           
           ## Available Protocols
           
-          | Protocol ID | Name | Registered At | Status |
-          |------------|------|--------------|--------|
+          | Protocol ID | Name | Type | Registered At | Status |
+          |------------|------|------|--------------|--------|
           EOF
           
-          # Add protocol entries
-          jq -r '.protocols[] | "| \(.id) | \(.name) | \(.registered_at) | \(.status) |"' .mcp/registry.json >> docs/index.md
+          # Add protocol entries if jq is available
+          if command -v jq &> /dev/null; then
+            jq -r '.protocols[] | "| \(.id) | \(.name) | \(.protocol_type) | \(.registered_at) | \(.status) |"' .mcp/registry.json >> docs/index.md
+          else
+            # Simple fallback if jq is not available
+            echo "| ${{ needs.register_protocol.outputs.protocol_id }} | ${{ needs.register_protocol.outputs.tenant_name }} | ${{ needs.register_protocol.outputs.protocol_type }} | $(date -u +"%Y-%m-%dT%H:%M:%SZ") | active |" >> docs/index.md
+          fi
           
           # Create protocol-specific page
           mkdir -p docs/protocols
@@ -552,6 +995,22 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           
+          # Stash any changes to create a clean working state
+          git stash -u || true
+          
+          # Pull latest changes
+          git pull --rebase origin ${{ github.ref_name }}
+          
+          # Reapply our changes
+          git stash pop || true
+          
+          # Stage changes
           git add docs/
-          git commit -m "Update API documentation"
-          git push
+          
+          # Only commit if there are changes to commit
+          if ! git diff --staged --quiet; then
+            git commit -m "Update API documentation"
+            git push
+          else
+            echo "No changes to commit"
+          fi
